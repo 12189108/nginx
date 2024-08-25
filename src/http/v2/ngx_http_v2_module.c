@@ -13,6 +13,9 @@
 
 static ngx_int_t ngx_http_v2_add_variables(ngx_conf_t *cf);
 
+static ngx_int_t ngx_http_v2_fingerprint_variable(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data);
+
 static ngx_int_t ngx_http_v2_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data);
 
@@ -217,7 +220,8 @@ static ngx_http_variable_t  ngx_http_v2_vars[] = {
 
     { ngx_string("http2"), NULL,
       ngx_http_v2_variable, 0, 0, 0 },
-
+    { ngx_string("http2_fingerprint"), NULL,
+      ngx_http_v2_fingerprint_variable, 0, 0, 0 },
       ngx_http_null_variable
 };
 
@@ -240,6 +244,183 @@ ngx_http_v2_add_variables(ngx_conf_t *cf)
     return NGX_OK;
 }
 
+void
+calculate_fingerprint(ngx_http_request_t *r, ngx_str_t* out)
+{
+    size_t cur = 0;
+    ngx_list_part_t *part;
+    ngx_http_v2_setting_t* setting;
+    ngx_http_v2_fingerprint_priority_t* priority;
+
+    ngx_http_v2_fingerprint_t* fp = r->stream->connection->fp;
+    ngx_list_part_t* setting_start = &fp->settings->part;
+    ngx_list_part_t* prio_start = &fp->priorities->part;
+
+    size_t setting_count = 0;
+    size_t priority_count = 0;
+    size_t header_count = 0;
+
+    part = &fp->settings->part;
+    setting = part->elts;
+
+    // the amount of semicolons and colons in between kv pairs - 1 at the end
+    size_t len = 0;
+    while (part) {
+        setting_count++;
+        setting = part->elts;
+        len += num_of_digits(setting->name)
+            + 1
+            + num_of_digits(setting->value) +
+            (part->next != NULL ? 1 : 0);
+        part = part->next;
+    }
+    // |12345| <- plus 2 pipes
+    // |00| if there's no window_update
+    size_t window_update_length = (fp->window_update == 0 ? 2 : num_of_digits(fp->window_update)) + 2;
+    len += window_update_length;
+
+    part = &fp->priorities->part;
+
+    // not counting pipes here, it's handled by header order
+    while (part) {
+        priority = part->elts;
+        priority_count++;
+        // 3 = num of colons
+        len += 3
+            + num_of_digits(priority->stream_id)
+            + num_of_digits(priority->exclusivity)
+            + num_of_digits(priority->dependent_stream_id)
+            + num_of_digits(priority->weight)
+            + (part->next != NULL ? 1 : 0 );
+
+        if (part->next == NULL) {
+            break;
+        }
+        part = part->next;
+    }
+    if (priority_count == 0) {
+        len+= 1;
+    }
+    // each header is one character separated by commas plus a pipe
+    part = &fp->pseudo_headers->part;
+    while (part) {
+        header_count++;
+        part = part->next;
+    }
+
+    len += (2 * header_count) + 1 ;
+
+    out->data = ngx_pnalloc(r->pool, len);
+    out->len = len;
+
+    part = setting_start;
+    while (part) {
+        setting = part->elts;
+        size_t part_len = num_of_digits(setting->name) + 1 + num_of_digits(setting->value);
+        if (part->next != NULL) {
+            // semicolon
+            part_len += 1;
+            ngx_snprintf(out->data + cur, part_len, "%ui:%ui;", setting->name, setting->value);
+        } else {
+            ngx_snprintf(out->data + cur, part_len, "%ui:%ui", setting->name, setting->value);
+        }
+        cur += part_len;
+        part = part->next;
+    }
+
+    /// Window Update
+    if (fp->window_update != 0) {
+        ngx_snprintf(out->data + cur, window_update_length, "|%ui|", fp->window_update);
+    } else {
+        ngx_snprintf(out->data + cur, window_update_length, "|00|");
+    }
+    cur += window_update_length;
+
+    /// Priority
+    if (priority_count == 0) {
+        ngx_snprintf(out->data + (cur++), 1, "0");
+    } else {
+        part = prio_start;
+        while (part) {
+            ngx_http_v2_fingerprint_priority_t* p = part->elts;
+            // 3 = num of colons
+            size_t part_len = 3
+                + num_of_digits(p->stream_id)
+                + num_of_digits(p->exclusivity)
+                + num_of_digits(p->dependent_stream_id)
+                + num_of_digits(p->weight);
+            if (part->next != NULL) {
+                // extra comma
+                part_len += 1;
+                ngx_snprintf(out->data + cur, part_len, "%ui:%ui:%ui:%ui,",
+                    p->stream_id,
+                    p->exclusivity,
+                    p->dependent_stream_id,
+                    p->weight
+                );
+            } else {
+                ngx_snprintf(out->data + cur, part_len, "%ui:%ui:%ui:%ui",
+                    p->stream_id,
+                    p->exclusivity,
+                    p->dependent_stream_id,
+                    p->weight
+                );
+            }
+            cur += part_len;
+
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+        }
+    }
+    // Pseudo headers
+    ngx_list_part_t* headers = &fp->pseudo_headers->part;
+    if (header_count > 0) {
+        ngx_snprintf(out->data + (cur++), 1, "|");
+        while (headers) {
+            ngx_str_t* header = headers->elts;
+            // nginx already strips out the leading colon of pseudo headers
+            int header_prefix = (header->data)[0];
+            len = 1;
+            if (headers->next != NULL) {
+                // extra comma
+                len += 1;
+                ngx_snprintf(out->data + cur, len, "%c,", header_prefix);
+            } else {
+                ngx_snprintf(out->data + cur, len, "%c", header_prefix);
+            }
+            cur += len;
+            headers = headers->next;
+        }
+    }
+
+    out->len = cur;
+}
+
+static ngx_int_t
+ngx_http_v2_fingerprint_variable(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data)
+{
+    ngx_str_t fp = ngx_null_string;
+    if (r->connection == NULL) {
+        return NGX_OK;
+    }
+    if (r->stream) {
+        // prevent data from being collected form the same connection again
+        r->stream->connection->fp->fingerprinted = 1;
+        calculate_fingerprint(r, &fp);
+
+        v->data = fp.data;
+        v->len = fp.len;
+        v->valid = 1;
+        v->no_cacheable = 1;
+        v->not_found = 0;
+        return NGX_OK;
+    }
+    *v = ngx_http_variable_null_value;
+    return NGX_OK;
+}
 
 static ngx_int_t
 ngx_http_v2_variable(ngx_http_request_t *r,
