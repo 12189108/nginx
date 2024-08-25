@@ -120,8 +120,35 @@ typedef struct {
     u_char                          *pos;
 } ngx_http_v2_hpack_t;
 
+typedef struct {
+    size_t stream_id;
+    ngx_uint_t exclusivity;
+    ngx_uint_t dependent_stream_id;
+    ngx_uint_t weight;
+} ngx_http_v2_fingerprint_priority_t;
+
+typedef struct {
+    ngx_uint_t                        name;
+    ngx_uint_t                        value;
+} ngx_http_v2_setting_t;
+
+typedef struct {
+    size_t window_update;
+
+    /* ngx_http_v2_header_t */
+    ngx_list_t* settings;
+    /* ngx_http_v2_fingerprint_priority_t */
+    ngx_list_t* priorities;
+    /* ngx_str_t */
+    ngx_list_t* pseudo_headers;
+    unsigned enable_push:1;
+    unsigned fingerprinted:1;
+} ngx_http_v2_fingerprint_t ;
+
+
 
 struct ngx_http_v2_connection_s {
+    ngx_http_v2_fingerprint_t       *fp;
     ngx_connection_t                *connection;
     ngx_http_connection_t           *http_connection;
 
@@ -291,6 +318,18 @@ ngx_http_v2_queue_ordered_frame(ngx_http_v2_connection_t *h2c,
     h2c->last_out = frame;
 }
 
+static ngx_inline size_t
+num_of_digits(int n)
+{
+    int c = 0;
+    if (n < 9) {
+        return 1;
+    }
+    for (; n; n /= 10) {
+        ++c;
+    }
+    return c;
+}
 
 void ngx_http_v2_init(ngx_event_t *rev);
 
