@@ -951,6 +951,15 @@ if [ $HTTP = YES ]; then
 
         . auto/module
     fi
+
+    ngx_module_name=ngx_http_rtt_module
+    ngx_module_incs=
+    ngx_module_deps=
+    ngx_module_srcs=src/http/modules/ngx_http_rtt_module.c
+    ngx_module_libs=
+    ngx_module_link=YES
+
+    . auto/module
 fi
 
 
@@ -1237,6 +1246,14 @@ if [ $STREAM != NO ]; then
 
         . auto/module
     fi
+
+    ngx_module_name=ngx_stream_rtt_module
+    ngx_module_deps=
+    ngx_module_srcs=src/stream/ngx_stream_rtt_module.c
+    ngx_module_libs=
+    ngx_module_link=YES
+
+    . auto/module
 fi
 
 
