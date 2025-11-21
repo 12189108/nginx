@@ -621,12 +621,11 @@ ngx_proxy_protocol_v2_write(ngx_connection_t *c, u_char *buf, u_char *last)
 {
     ngx_proxy_protocol_header_t  *header;
     u_char                        *p, *addr_start;
-    size_t                         len, addr_len;
+    size_t                         len;
     ngx_uint_t                     family, transport;
-    ngx_sockaddr_t                 src_sockaddr, dst_sockaddr;
     in_port_t                      src_port, dst_port;
 
-    if (last - buf < sizeof(ngx_proxy_protocol_header_t) + 256) {
+    if ((size_t) (last - buf) < sizeof(ngx_proxy_protocol_header_t) + 256) {
         ngx_log_error(NGX_LOG_ALERT, c->log, 0,
                       "too small buffer for PROXY protocol v2");
         return NULL;
@@ -649,19 +648,19 @@ ngx_proxy_protocol_v2_write(ngx_connection_t *c, u_char *buf, u_char *last)
     switch (c->sockaddr->sa_family) {
     case AF_INET:
         family = NGX_PROXY_PROTOCOL_AF_INET;
-        addr_len = sizeof(ngx_proxy_protocol_inet_addrs_t);
         break;
 #if (NGX_HAVE_INET6)
     case AF_INET6:
         family = NGX_PROXY_PROTOCOL_AF_INET6;
-        addr_len = sizeof(ngx_proxy_protocol_inet6_addrs_t);
         break;
 #endif
     default:
         family = 0; /* UNSPEC */
-        addr_len = 0;
         break;
     }
+
+    src_port = 0;
+    dst_port = 0;
 
     transport = 1; /* STREAM */
     header->family_transport = (family << 4) | transport;
