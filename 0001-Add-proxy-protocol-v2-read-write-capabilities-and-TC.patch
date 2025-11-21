@@ -2,8 +2,8 @@ From 666123f7cd68ec0c0513e3ce4c20e1afb05d16a3 Mon Sep 17 00:00:00 2001
 From: "engine-labs-app[bot]"
  <140088366+engine-labs-app[bot]@users.noreply.github.com>
 Date: Fri, 21 Nov 2025 10:33:36 +0000
-Subject: [PATCH] Add proxy protocol v2 read/write capabilities and TCP/TLS RTT
- analysis module
+Subject: [PATCH 1/2] Add proxy protocol v2 read/write capabilities and TCP/TLS
+ RTT analysis module
 
 - Enhanced ngx_proxy_protocol.h with new TLV types and function declarations
 - Added ngx_proxy_protocol_v2_write() function for v2 protocol writing
