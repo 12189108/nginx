@@ -82,6 +82,8 @@ static ngx_proxy_protocol_tlv_entry_t  ngx_proxy_protocol_tlv_entries[] = {
     { ngx_string("unique_id"),  0x05 },
     { ngx_string("ssl"),        0x20 },
     { ngx_string("netns"),      0x30 },
+    { ngx_string("tcp_rtt"),    NGX_PROXY_PROTOCOL_TLV_TCP_RTT },
+    { ngx_string("tls_rtt"),    NGX_PROXY_PROTOCOL_TLV_TLS_RTT },
     { ngx_null_string,          0x00 }
 };
 
@@ -611,4 +613,183 @@ ngx_proxy_protocol_lookup_tlv(ngx_connection_t *c, ngx_str_t *tlvs,
     }
 
     return NGX_DECLINED;
+}
+
+
+u_char *
+ngx_proxy_protocol_v2_write(ngx_connection_t *c, u_char *buf, u_char *last)
+{
+    ngx_proxy_protocol_header_t  *header;
+    u_char                        *p;
+    size_t                         len;
+    ngx_uint_t                     family, transport;
+    in_port_t                      src_port, dst_port;
+
+    if ((size_t) (last - buf) < sizeof(ngx_proxy_protocol_header_t) + 256) {
+        ngx_log_error(NGX_LOG_ALERT, c->log, 0,
+                      "too small buffer for PROXY protocol v2");
+        return NULL;
+    }
+
+    if (ngx_connection_local_sockaddr(c, NULL, 0) != NGX_OK) {
+        return NULL;
+    }
+
+    header = (ngx_proxy_protocol_header_t *) buf;
+    ngx_memzero(header, sizeof(ngx_proxy_protocol_header_t));
+
+    /* Set signature */
+    ngx_memcpy(header->signature, "\r\n\r\n\0\r\nQUIT\n", 12);
+
+    /* Set version 2, command PROXY */
+    header->version_command = 0x21;
+
+    /* Determine address family and transport protocol */
+    switch (c->sockaddr->sa_family) {
+    case AF_INET:
+        family = NGX_PROXY_PROTOCOL_AF_INET;
+        break;
+#if (NGX_HAVE_INET6)
+    case AF_INET6:
+        family = NGX_PROXY_PROTOCOL_AF_INET6;
+        break;
+#endif
+    default:
+        family = 0; /* UNSPEC */
+        break;
+    }
+
+    transport = 1; /* STREAM */
+    header->family_transport = (family << 4) | transport;
+
+    p = buf + sizeof(ngx_proxy_protocol_header_t);
+
+    /* Write addresses */
+    if (family == NGX_PROXY_PROTOCOL_AF_INET) {
+        ngx_proxy_protocol_inet_addrs_t *in;
+
+        in = (ngx_proxy_protocol_inet_addrs_t *) p;
+        ngx_memzero(in, sizeof(ngx_proxy_protocol_inet_addrs_t));
+
+        /* Source address and port */
+        ngx_memcpy(in->src_addr, &((struct sockaddr_in *) c->sockaddr)->sin_addr, 4);
+        src_port = ngx_inet_get_port(c->sockaddr);
+        in->src_port[0] = src_port >> 8;
+        in->src_port[1] = src_port & 0xff;
+
+        /* Destination address and port */
+        ngx_memcpy(in->dst_addr, &((struct sockaddr_in *) c->local_sockaddr)->sin_addr, 4);
+        dst_port = ngx_inet_get_port(c->local_sockaddr);
+        in->dst_port[0] = dst_port >> 8;
+        in->dst_port[1] = dst_port & 0xff;
+
+        p += sizeof(ngx_proxy_protocol_inet_addrs_t);
+
+#if (NGX_HAVE_INET6)
+    } else if (family == NGX_PROXY_PROTOCOL_AF_INET6) {
+        ngx_proxy_protocol_inet6_addrs_t *in6;
+
+        in6 = (ngx_proxy_protocol_inet6_addrs_t *) p;
+        ngx_memzero(in6, sizeof(ngx_proxy_protocol_inet6_addrs_t));
+
+        /* Source address and port */
+        ngx_memcpy(in6->src_addr, &((struct sockaddr_in6 *) c->sockaddr)->sin6_addr, 16);
+        src_port = ngx_inet_get_port(c->sockaddr);
+        in6->src_port[0] = src_port >> 8;
+        in6->src_port[1] = src_port & 0xff;
+
+        /* Destination address and port */
+        ngx_memcpy(in6->dst_addr, &((struct sockaddr_in6 *) c->local_sockaddr)->sin6_addr, 16);
+        dst_port = ngx_inet_get_port(c->local_sockaddr);
+        in6->dst_port[0] = dst_port >> 8;
+        in6->dst_port[1] = dst_port & 0xff;
+
+        p += sizeof(ngx_proxy_protocol_inet6_addrs_t);
+#endif
+    } else {
+        /* No address family - skip address writing */
+        src_port = 0;
+        dst_port = 0;
+    }
+
+    /* Calculate length (addresses + any TLVs) */
+    len = p - (buf + sizeof(ngx_proxy_protocol_header_t));
+
+    /* Add room for custom TLVs if they exist */
+    if (c->proxy_protocol && c->proxy_protocol->tlvs.len > 0) {
+        len += c->proxy_protocol->tlvs.len;
+        if (p + c->proxy_protocol->tlvs.len > last) {
+            ngx_log_error(NGX_LOG_ALERT, c->log, 0,
+                          "buffer too small for PROXY protocol v2 TLVs");
+            return NULL;
+        }
+        ngx_memcpy(p, c->proxy_protocol->tlvs.data, c->proxy_protocol->tlvs.len);
+        p += c->proxy_protocol->tlvs.len;
+    }
+
+    /* Set length in header */
+    header->len[0] = (u_char) (len >> 8);
+    header->len[1] = (u_char) (len & 0xff);
+
+    ngx_log_debug4(NGX_LOG_DEBUG_CORE, c->log, 0,
+                   "PROXY protocol v2 src: %d, dst: %d, len: %uz, family: %ui",
+                   (int) src_port, (int) dst_port, len, family);
+
+    return p;
+}
+
+
+ngx_int_t
+ngx_proxy_protocol_set_tlv(ngx_connection_t *c, ngx_uint_t type,
+    ngx_str_t *value)
+{
+    ngx_proxy_protocol_t  *pp;
+    ngx_proxy_protocol_tlv_t *tlv;
+    u_char                *p;
+    size_t                 new_len;
+
+    if (value == NULL) {
+        return NGX_ERROR;
+    }
+
+    /* Ensure proxy protocol structure exists */
+    if (c->proxy_protocol == NULL) {
+        c->proxy_protocol = ngx_pcalloc(c->pool, sizeof(ngx_proxy_protocol_t));
+        if (c->proxy_protocol == NULL) {
+            return NGX_ERROR;
+        }
+    }
+
+    pp = c->proxy_protocol;
+
+    /* Calculate new TLV section length */
+    new_len = pp->tlvs.len + sizeof(ngx_proxy_protocol_tlv_t) + value->len;
+
+    /* Reallocate TLV buffer */
+    p = ngx_pnalloc(c->pool, new_len);
+    if (p == NULL) {
+        return NGX_ERROR;
+    }
+
+    /* Copy existing TLVs */
+    if (pp->tlvs.len > 0) {
+        ngx_memcpy(p, pp->tlvs.data, pp->tlvs.len);
+    }
+
+    /* Add new TLV */
+    tlv = (ngx_proxy_protocol_tlv_t *) (p + pp->tlvs.len);
+    tlv->type = type;
+    tlv->len[0] = value->len >> 8;
+    tlv->len[1] = value->len & 0xff;
+    ngx_memcpy(tlv + 1, value->data, value->len);
+
+    /* Update TLV pointer */
+    pp->tlvs.data = p;
+    pp->tlvs.len = new_len;
+
+    ngx_log_debug2(NGX_LOG_DEBUG_CORE, c->log, 0,
+                   "PROXY protocol set TLV type:0x%02ux len:%uz",
+                   type, value->len);
+
+    return NGX_OK;
 }
