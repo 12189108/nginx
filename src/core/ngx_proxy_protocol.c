@@ -620,7 +620,7 @@ u_char *
 ngx_proxy_protocol_v2_write(ngx_connection_t *c, u_char *buf, u_char *last)
 {
     ngx_proxy_protocol_header_t  *header;
-    u_char                        *p, *addr_start;
+    u_char                        *p;
     size_t                         len;
     ngx_uint_t                     family, transport;
     in_port_t                      src_port, dst_port;
@@ -659,14 +659,10 @@ ngx_proxy_protocol_v2_write(ngx_connection_t *c, u_char *buf, u_char *last)
         break;
     }
 
-    src_port = 0;
-    dst_port = 0;
-
     transport = 1; /* STREAM */
     header->family_transport = (family << 4) | transport;
 
     p = buf + sizeof(ngx_proxy_protocol_header_t);
-    addr_start = p;
 
     /* Write addresses */
     if (family == NGX_PROXY_PROTOCOL_AF_INET) {
@@ -710,10 +706,14 @@ ngx_proxy_protocol_v2_write(ngx_connection_t *c, u_char *buf, u_char *last)
 
         p += sizeof(ngx_proxy_protocol_inet6_addrs_t);
 #endif
+    } else {
+        /* No address family - skip address writing */
+        src_port = 0;
+        dst_port = 0;
     }
 
     /* Calculate length (addresses + any TLVs) */
-    len = p - addr_start;
+    len = p - (buf + sizeof(ngx_proxy_protocol_header_t));
 
     /* Add room for custom TLVs if they exist */
     if (c->proxy_protocol && c->proxy_protocol->tlvs.len > 0) {
@@ -728,12 +728,12 @@ ngx_proxy_protocol_v2_write(ngx_connection_t *c, u_char *buf, u_char *last)
     }
 
     /* Set length in header */
-    header->len[0] = len >> 8;
-    header->len[1] = len & 0xff;
+    header->len[0] = (u_char) (len >> 8);
+    header->len[1] = (u_char) (len & 0xff);
 
     ngx_log_debug4(NGX_LOG_DEBUG_CORE, c->log, 0,
                    "PROXY protocol v2 src: %d, dst: %d, len: %uz, family: %ui",
-                   src_port, dst_port, len, family);
+                   (int) src_port, (int) dst_port, len, family);
 
     return p;
 }
